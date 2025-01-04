@@ -70,6 +70,6 @@ pub enum ArgError {
         example: String,
     },
 
-    #[error("--url argument: {0} is not a supported site.\nrun with --help for a list of supported sites.")]
+    #[error("--url argument: {0} is not a supported site.\n run with --help for a list of supported sites.")]
     WebsiteNotSupported(String),
 }
