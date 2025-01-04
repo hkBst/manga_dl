@@ -2,32 +2,166 @@ mod cli;
 mod error;
 mod loading;
 mod macros;
-mod mangagun;
-mod mangareader;
-mod rawmanga;
+mod sites;
 
 use std::{
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, Command},
-    time,
+    time::{self, Duration},
 };
 
-use crate::mangagun::dl_mangagun;
-use crate::mangareader::dl_mangareader;
-use cli::{get_args, Cli, LogLevel, Url};
+use cli::{get_args, Cli, LogLevel, MangaUrl, SupportedSites};
 #[allow(unused_imports)]
-use color_eyre::{eyre::Result, owo_colors::OwoColorize, Report};
-use error::{MainError, MangaReaderError};
-use fantoccini::{Client, Locator};
+use color_eyre::{
+    eyre::{Context, Result},
+    owo_colors::OwoColorize,
+    Report,
+};
+use error::{DownloadImageError, MainError, MangaReaderError};
+use fantoccini::{elements::Element, Client, Locator};
 use loading::{print_indexes_arg, print_reqerr_count};
-use mangagun::NavigateGroup;
-use rawmanga::dl_rawmanga;
+use reqwest::Client as ReqClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string_pretty};
+use sites::{
+    mangafire::dl_mangafire, mangagun::dl_mangagun, mangagun::NavigateGroup,
+    mangareader::dl_mangareader, rawmanga::dl_rawmanga,
+};
 use spinners::Spinner;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+pub trait WebsiteActions {
+    fn count_total_pages(&self, query: &str) -> impl Future<Output = Result<usize>>;
+    fn query_selector_all(
+        &self,
+        query: &str,
+        page_count: usize,
+        retries: usize,
+        sleep: Duration,
+    ) -> impl Future<Output = Result<Vec<Element>, Report>>;
+}
+
+impl WebsiteActions for Client {
+    /// manga_dl fn that finds query
+    /// only if the element has a number in it's inner_text
+    async fn count_total_pages(&self, query: &str) -> Result<usize> {
+        let el = self
+            .wait()
+            .at_most(Duration::from_secs(3))
+            .for_element(Locator::Css(query))
+            .await?;
+        let count = el.text().await?;
+        let count = count
+            .parse::<usize>()
+            .wrap_err(format!("failed to parse total pages: '{count}' as usize"))?;
+        Ok(count)
+    }
+
+    async fn query_selector_all(
+        &self,
+        query: &str,
+        page_count: usize,
+        retries: usize,
+        sleep: Duration,
+    ) -> Result<Vec<Element>> {
+        let query = query.to_string();
+        let mut imgs = self
+            .find_all(Locator::Css(&query))
+            .await
+            .with_context(|| WebsiteError {
+                website: SupportedSites::MangaFire,
+                kind: WebsiteErrorKind::QuerySelectorAll {
+                    query: query.clone(),
+                },
+            })?;
+
+        let mut count = 0;
+        while count < retries && imgs.len() < page_count {
+            count += 1;
+            tokio::time::sleep(sleep).await;
+            imgs = self.find_all(Locator::Css(&query)).await?;
+        }
+
+        if imgs.is_empty() {
+            Err(WebsiteError {
+                website: SupportedSites::MangaFire,
+                kind: WebsiteErrorKind::QuerySelectorAll { query },
+            })?;
+        } else if imgs.len() < page_count {
+            Err(WebsiteError {
+                website: SupportedSites::MangaFire,
+                kind: WebsiteErrorKind::MissingImagesAfterMaxRetries {
+                    img_count: imgs.len(),
+                    page_count,
+                    query,
+                },
+            })?;
+        }
+
+        Ok(imgs)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{website}:\n  {kind}")]
+pub struct WebsiteError {
+    website: SupportedSites,
+    kind: WebsiteErrorKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WebsiteErrorKind {
+    #[error("the query matched 0 elements on the page.\n  [query]= '{query}'")]
+    QuerySelectorAll { query: String },
+    #[error(
+        "failed to query -> '{query}'\n   the query only matched {img_count} <img />s when {page_count} were expected."
+    )]
+    MissingImagesAfterMaxRetries {
+        img_count: usize,
+        page_count: usize,
+        query: String,
+    },
+}
+
+#[derive(Eq, Hash, PartialEq, Debug)]
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    pub path: String,
+}
+
+impl ImageData {}
+
+#[derive(Eq, Hash, PartialEq, Debug)]
+pub struct ReqImageData {
+    pub url: String,
+    pub path: String,
+}
+
+impl ReqImageData {
+    pub async fn dl_src(&self, req_c: &ReqClient) -> Result<ImageData, DownloadImageError> {
+        let Self { url, path } = &self;
+        let res = req_c
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DownloadImageError::GetReqwest(url.to_string(), e.to_string()))?;
+        let bytes = res
+            .bytes()
+            .await
+            .wrap_err(format!("failed to decode src_url to bytes: {url}"))?
+            .to_vec();
+        let img = ImageData {
+            bytes,
+            path: path.clone(),
+        };
+
+        Ok(img)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +170,7 @@ async fn main() -> Result<()> {
     let args = get_args()?;
     println!("{:#?}", args.log);
     match args.log {
-        LogLevel::Full | LogLevel::Verbose => {
+        LogLevel::Trace => {
             std::env::set_var("RUST_BACKTRACE", "1");
         }
         _ => { /* skip */ }
@@ -79,6 +213,11 @@ async fn main() -> Result<()> {
                     errors.push(e);
                 };
             }
+            cli::SupportedSites::MangaFire => {
+                if let Err(e) = dl_mangafire(&c, url, &args).await {
+                    errors.push(e);
+                };
+            }
         }
     }
 
@@ -86,7 +225,7 @@ async fn main() -> Result<()> {
     child.kill().expect("failed to kill geckodriver");
     child
         .wait()
-        .expect("panicked while waiting for geckodriver to exit after attempting terminate");
+        .expect("panicked while waiting for geckodriver to exit after attempting to terminate");
     cleanup();
 
     if !errors.is_empty() {
@@ -98,8 +237,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let elap = instant.elapsed().as_secs();
-    println!("\nelapsed: {}s", elap);
+    let elapsed = instant.elapsed().as_secs();
+    println!("\nelapsed: {}s", elapsed);
 
     Ok(())
 }
@@ -126,14 +265,15 @@ pub fn write_log(e: LogError) -> Result<(), io::Error> {
 
 /// cross platform way to get the path to the gecko driver
 pub fn os_get_geckodriver_exe_path() -> PathBuf {
-    #[allow(inactive_code)]
-    #[cfg(target_os = "windows")]
-    Path::from("../bin/geckodriver-win.exe");
-    #[cfg(target_os = "macos")]
-    Path::from("../bin/geckodriver-macos");
-    // Only tested with arch
-    #[cfg(target_os = "linux")]
-    PathBuf::from("../bin/geckodriver-linux")
+    if cfg!(target_os = "windows") {
+        PathBuf::from("../bin/geckodriver-win.exe")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("../bin/geckodriver-macos")
+    } else if cfg!(target_os = "linux") {
+        PathBuf::from("../bin/geckodriver-linux")
+    } else {
+        panic!("Unsupported operating system")
+    }
 }
 
 // pub fn os_get_geckodriver_exe_path_if() -> PathBuf {
@@ -200,7 +340,7 @@ pub fn start_gd(gd_data: &[u8]) -> Result<Child, std::io::Error> {
 async fn start_client(log: &LogLevel) -> Result<Client, fantoccini::error::NewSessionError> {
     let mut builder = fantoccini::ClientBuilder::native();
 
-    if log != &LogLevel::Full {
+    if log != &LogLevel::Trace {
         let caps: serde_json::Map<String, serde_json::Value> = json!({
             "moz:firefoxOptions": {
                 "args": ["-headless"]
@@ -251,7 +391,8 @@ pub async fn g_handle_popup(c: &Client) -> Result<(), MainError> {
     Ok(())
 }
 
-pub async fn setup_nav(client: &Client, url: &Url, args: &Cli) -> Result<NavigateGroup> {
+/// returns [`NavigateGroup`]
+pub async fn setup_nav(client: &Client, url: &MangaUrl, args: &Cli) -> Result<NavigateGroup> {
     let title = url.title.clone().unwrap_or_else(|| gen_rand().to_string());
     let dl_path = match &args.input_path {
         Some(p) => format!("{p}/{}", title),
@@ -267,7 +408,7 @@ pub async fn setup_nav(client: &Client, url: &Url, args: &Cli) -> Result<Navigat
     println!("\n{:?}", url.site);
     let message = format!("{}: {}", "", style_text!(&title, url));
     let mut sp = Spinner::new(spinners::Spinners::Arc, message);
-    client.goto(&url.url).await?;
+    client.goto(&url.inner).await?;
     sp.stop_with_newline();
 
     Ok((title, dl_path, sp))
