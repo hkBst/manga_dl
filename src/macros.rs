@@ -5,7 +5,7 @@ use color_eyre::owo_colors::OwoColorize;
 macro_rules! style_text {
     // Match URLs
     ($text:expr, url) => {
-        ($text).purple()
+        ($text).white()
     };
 
     // Match file paths
