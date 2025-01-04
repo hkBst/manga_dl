@@ -1,4 +1,6 @@
 target
 download/*
 download
+temp
+temp/*
 
