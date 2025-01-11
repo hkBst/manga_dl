@@ -3,26 +3,25 @@ use std::time::{Duration, Instant};
 use fantoccini::Client;
 
 use crate::{
-    cli::{Cli, LogLevel, MangaUrl},
+    cli::{LogLevel, MangaUrl},
     g_close_open_window,
-    loading::print_download_complete_msg,
-    setup_nav,
-    sites::mangareader::write_img,
-    ImageData, ReqImageData, WebsiteActions,
+    loading::print_elapsed,
+    setup_nav, ImageData, ReqImageData, WebsiteActions, WriteAllExt, PROGRAM_CLI,
 };
 
 use reqwest::Client as ReqClient;
 
-use super::mangagun::hide_elements_with_max_index;
-
-pub async fn dl_mangafire(client: &Client, url: &MangaUrl, cli: &Cli) -> color_eyre::Result<()> {
-    let (_, dl_path, _) = setup_nav(client, url, cli).await?;
+pub async fn dl_mangafire(client: &Client, url: &MangaUrl) -> color_eyre::Result<()> {
+    let (_, dl_path, _) = setup_nav(client, url).await?;
     let start = Instant::now();
 
     let query = "img[data-number][src]".to_string();
     let sleep = Duration::from_millis(1000);
     let retries = 3;
-    let page_count = client.count_total_pages("span > b.total-page").await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let page_count = client
+        .count_total_pages("span > b.total-page", Duration::from_secs(5))
+        .await?;
 
     let html = client.find(fantoccini::Locator::Css("html")).await?;
     html.click().await?;
@@ -36,6 +35,7 @@ pub async fn dl_mangafire(client: &Client, url: &MangaUrl, cli: &Cli) -> color_e
         .click()
         .await?;
 
+    // click every other panel to load all pages before downloading
     for i in 1..page_count {
         if i % 2 == 0 {
             client
@@ -63,15 +63,15 @@ pub async fn dl_mangafire(client: &Client, url: &MangaUrl, cli: &Cli) -> color_e
         }
     }
 
-    img_data.iter().for_each(|d| write_img(d).unwrap());
-
-    match cli.log {
+    match PROGRAM_CLI.log {
         LogLevel::Verbose | LogLevel::Trace => {
             let elapsed = start.elapsed();
-            print_download_complete_msg(elapsed);
+            print_elapsed(elapsed);
         }
         _ => { /* skip */ }
     }
+
+    img_data.into_iter().write_all()?;
 
     Ok(())
 }
