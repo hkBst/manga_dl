@@ -8,11 +8,10 @@ pub fn print_indexes_arg(indexes: &Vec<usize>) {
     println!("only downloading indexes: {:?}.", indexes);
 }
 
-pub fn downloading_panel_data_msg(i: u16, max: u16) -> String {
+pub fn downloading_panel_data_msg(i: usize, max: usize) -> String {
     format!(
         "{}",
-        //"downloading panel data..".bright_green(),
-        format_args!("{} / {}", style_text!(i + 1, url), style_text!(max, url))
+        format_args!("({} .. {})", style_text!(i + 1, url), style_text!(max, url))
     )
 }
 
@@ -29,12 +28,8 @@ pub fn indexes_failed_msg(len: usize) -> String {
     )
 }
 
-pub fn print_download_complete_msg(elapsed: Duration) {
+pub fn print_elapsed(elapsed: Duration) {
     let elap = format!("{:.?}", elapsed);
-    // let msg = format!(
-    //     "finished in {}.",
-    //     //style_text!("download complete", success),
-    // );
     println!("{}\n", style_text!(elap, url));
 }
 
