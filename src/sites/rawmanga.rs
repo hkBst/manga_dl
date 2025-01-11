@@ -13,29 +13,31 @@ use color_eyre::{
 use fantoccini::{Client, Locator};
 use reqwest::ClientBuilder as ReqClientBuilder;
 use spinners::{Spinner, Spinners};
-//use spinners::{Spinner, Spinners};
 
 use crate::{
-    cli::{Cli, LogLevel, MangaUrl},
+    cli::{LogLevel, MangaUrl},
     g_handle_popup,
     loading::{downloading_panel_data_msg, print_reqerr_count},
     setup_nav,
-    sites::mangareader::{download_img_src, write_img},
+    sites::mangareader::download_img_src,
+    WriteAllExt, PROGRAM_CLI,
 };
 
 use crate::ReqImageData;
 
-pub async fn dl_rawmanga(client: &Client, url: &MangaUrl, args: &Cli) -> Result<()> {
-    let (title, dl_path, mut sp) = setup_nav(client, url, args).await?;
+pub async fn dl_rawmanga(client: &Client, url: &MangaUrl) -> Result<()> {
+    let (title, dl_path, mut sp) = setup_nav(client, url).await?;
     //let start = Instant::now();
 
-    let index_map: Option<HashSet<&usize>> =
-        args.indexes.as_ref().map(|slice| slice.iter().collect());
+    let index_map: Option<HashSet<&usize>> = PROGRAM_CLI
+        .pages
+        .as_ref()
+        .map(|slice| slice.iter().collect());
 
     let req_client = ReqClientBuilder::new().timeout(Duration::from_millis(2500));
     let req_client = req_client.build()?;
 
-    let src_urls = get_all_image_srcs(&dl_path, client, index_map, &args.log).await?;
+    let src_urls = get_all_image_srcs(&dl_path, client, index_map).await?;
     let mut img_data = Vec::with_capacity(src_urls.len());
     let mut error_reports = Vec::with_capacity(src_urls.len());
 
@@ -51,15 +53,12 @@ pub async fn dl_rawmanga(client: &Client, url: &MangaUrl, args: &Cli) -> Result<
                     error_reports.push(report);
                 }
             }
-            let msg = downloading_panel_data_msg(i as u16, max as u16);
+            let msg = downloading_panel_data_msg(i, max);
             sp = Spinner::new(Spinners::Arc, msg);
         }
     }
     sp.stop_with_newline();
-
-    img_data
-        .into_iter()
-        .for_each(|data| write_img(&data).unwrap());
+    img_data.into_iter().write_all()?;
 
     if !error_reports.is_empty() {
         print_reqerr_count(error_reports.len(), &title);
@@ -78,7 +77,6 @@ async fn get_all_image_srcs(
     dl_path: &str,
     c: &Client,
     index_map: Option<HashSet<&usize>>,
-    log: &LogLevel,
 ) -> Result<HashSet<ReqImageData>> {
     g_handle_popup(c).await.wrap_err(line!())?;
     let imgs = c.find_all(Locator::Css("div.page-chapter img")).await?;
@@ -95,7 +93,7 @@ async fn get_all_image_srcs(
         if let Some(src) = img.attr("src").await? {
             let path = format!("{dl_path}/{i}.jpg");
             let img = ReqImageData { url: src, path };
-            match log {
+            match PROGRAM_CLI.log {
                 LogLevel::Trace | LogLevel::Verbose => println!("{:?}", img),
                 _ => {}
             }
