@@ -13,18 +13,15 @@ use spinners::{Spinner, Spinners};
 use tokio::time::sleep;
 
 use crate::{
-    cli::{Cli, LogLevel, MangaUrl},
+    cli::{LogLevel, MangaUrl},
     g_handle_popup,
-    loading::{downloading_panel_data_msg, print_download_complete_msg},
-    setup_nav,
-    sites::mangareader::write_img,
-    ImageData,
+    loading::downloading_panel_data_msg,
+    setup_nav, ImageData, PROGRAM_CLI,
 };
+use crate::{loading::print_elapsed, WriteAllExt};
 
-pub type NavigateGroup = (String, String, Spinner);
-
-pub async fn dl_mangagun(client: &Client, url: &MangaUrl, args: &Cli) -> Result<()> {
-    let (_, dl_path, mut sp) = setup_nav(client, url, args).await?;
+pub async fn dl_mangagun(client: &Client, url: &MangaUrl) -> Result<()> {
+    let (_, dl_path, mut sp) = setup_nav(client, url).await?;
     let start = Instant::now();
 
     // hide the top-navbar
@@ -32,84 +29,26 @@ pub async fn dl_mangagun(client: &Client, url: &MangaUrl, args: &Cli) -> Result<
     // hide the bottom-navbar
     execute_set_element_hidden_inline(client, "#rd-side_icon").await?;
 
-    let index_map: Option<HashSet<&usize>> =
-        args.indexes.as_ref().map(|slice| slice.iter().collect());
-    let img_data = get_all_images(&dl_path, client, &mut sp, index_map, &args.log).await?;
+    let index_map: Option<HashSet<&usize>> = PROGRAM_CLI
+        .pages
+        .as_ref()
+        .map(|slice| slice.iter().collect());
+    let img_data = get_all_images(&dl_path, client, &mut sp, index_map).await?;
 
-    match args.log {
+    match PROGRAM_CLI.log {
         LogLevel::Verbose | LogLevel::Trace => {
             let elapsed = start.elapsed();
             println!();
-            print_download_complete_msg(elapsed);
+            print_elapsed(elapsed);
         }
         _ => { /* skip */ }
     }
 
-    img_data
-        .into_iter()
-        .for_each(|data| write_img(&data).unwrap());
+    // img_data: HashSet<ImageData>
+    img_data.into_iter().write_all()?;
 
     Ok(())
 }
-
-// async fn get_all_images(
-//     dl_path: &str,
-//     c: &Client,
-//     sp: &mut Spinner,
-//     index_map: Option<HashSet<&usize>>,
-//     log: &LogLevel,
-// ) -> Result<HashSet<ImageData>> {
-//     g_handle_popup(c).await.wrap_err(line!())?;
-//     let imgs = c.find_all(Locator::Css("img.chapter-img")).await?;
-//     let max = imgs.len();
-//     let mut new_imgs: HashSet<ImageData> = HashSet::with_capacity(max);
-//
-//     // if the index map is Some, skip indexes that aren't specified
-//     for (i, img) in imgs.into_iter().enumerate() {
-//         if let Some(i_map) = &index_map {
-//             if !i_map.contains(&i) {
-//                 continue;
-//             }
-//         }
-//         execute_set_element_hidden_inline(c, "#adModal").await?;
-//         execute_set_element_hidden_computed(c).await?;
-//
-//         // wait until the image src is not the loading GIF
-//         while let Some(src) = img.attr("src").await? {
-//             if !src.contains("gif") {
-//                 // Get the rectangle to confirm dimensions as additional verification
-//                 let rect = img.rectangle().await?;
-//                 if rect.2 > 500.0 && rect.3 > 500.0 {
-//                     match log {
-//                         LogLevel::Trace => {
-//                             print!(":\n  {src}");
-//                             std::io::stdout().flush().expect("failed to flush output");
-//                         }
-//                         _ => { /* skip */ }
-//                     }
-//                     let msg = downloading_panel_data_msg(i as u16, max as u16);
-//                     *sp = Spinner::new(Spinners::Arc, msg);
-//                 }
-//                 break;
-//             }
-//
-//             // Introduce a timeout for safety to avoid indefinite looping
-//             if timeout(Duration::from_secs(10), sleep(Duration::from_millis(300)))
-//                 .await
-//                 .is_err()
-//             {
-//                 return Err(eyre!("Timeout waiting for image to load at index {i}"));
-//             }
-//         }
-//         let bytes = img.screenshot().await?;
-//         let path = format!("{dl_path}/{i}.jpg");
-//         let img = ImageData { bytes, path };
-//
-//         new_imgs.insert(img);
-//     }
-//
-//     Ok(new_imgs)
-// }
 
 const IMAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -120,7 +59,6 @@ async fn get_all_images(
     c: &Client,
     sp: &mut Spinner,
     index_map: Option<HashSet<&usize>>,
-    log: &LogLevel,
 ) -> Result<HashSet<ImageData>> {
     g_handle_popup(c).await.wrap_err(line!())?;
     let imgs = c.find_all(Locator::Css("img.chapter-img")).await?;
@@ -142,7 +80,7 @@ async fn get_all_images(
         // Wait for valid image to load
         match wait_for_valid_image(&img, i).await {
             Ok(()) => {
-                update_progress(i, max, sp, log, &img).await?;
+                update_progress(i, max, sp, &img).await?;
 
                 // Capture and store image
                 let bytes = img.screenshot().await?;
@@ -184,27 +122,21 @@ async fn wait_for_valid_image(img: &Element, index: usize) -> Result<()> {
     Err(eyre!("Timeout waiting for valid image at index {index}"))
 }
 
-async fn update_progress(
-    index: usize,
-    max: usize,
-    sp: &mut Spinner,
-    log: &LogLevel,
-    img: &Element,
-) -> Result<()> {
-    if matches!(log, LogLevel::Trace) {
+async fn update_progress(index: usize, max: usize, sp: &mut Spinner, img: &Element) -> Result<()> {
+    if matches!(PROGRAM_CLI.log, LogLevel::Trace) {
         if let Some(src) = img.attr("src").await? {
             print!(":\n  {src}");
             std::io::stdout().flush().expect("failed to flush output");
         }
     }
 
-    let msg = downloading_panel_data_msg(index as u16, max as u16);
+    let msg = downloading_panel_data_msg(index, max);
     *sp = Spinner::new(Spinners::Arc, msg);
 
     Ok(())
 }
 
-/// loops over every element and sets any elements with a `computed` zIndex of 
+/// loops over every element and sets any elements with a `computed` zIndex of
 /// '2147483647' to `display = 'none'`.
 pub async fn hide_elements_with_max_index(c: &Client) -> Result<()> {
     let script = r#"
