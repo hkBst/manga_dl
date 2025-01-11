@@ -34,13 +34,13 @@ macro_rules! style_text {
     ($text:expr) => {{
         let text = $text.to_string();
         if text.contains(".to") && text.contains('/') {
-            ($text).purple().to_string()
+            ($text).white().to_string()
         } else if text.contains('/') {
             ($text).white().bold().to_string()
         } else if text.to_lowercase().contains("error") {
             ($text).red().bold().to_string()
         } else {
-            ($text).green().to_string()
+            text
         }
     }};
 }
