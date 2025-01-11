@@ -2,11 +2,11 @@ use base64::prelude::*;
 use std::{collections::HashSet, fs::read_dir, time::Duration};
 
 use crate::{
-    cli::{Cli, MangaUrl},
+    cli::MangaUrl,
     error::{DownloadImageError, MangaReaderError},
     g_close_open_window,
     loading::print_reqerr_count,
-    setup_nav,
+    setup_nav, WebsiteActions, WriteAllExt,
 };
 use crate::{error::MainError, loading::downloading_panel_data_msg};
 use color_eyre::{
@@ -24,19 +24,16 @@ use crate::{ImageData, ReqImageData};
 /// Arguments
 ///
 /// * `index` - needed because mangareader has a popup on render,
-pub async fn dl_mangareader(
-    client: &Client,
-    url: &MangaUrl,
-    args: &Cli,
-    index: usize,
-) -> Result<()> {
-    let (title, dl_path, mut _sp) = setup_nav(client, url, args).await?;
+pub async fn dl_mangareader(client: &Client, url: &MangaUrl, index: usize) -> Result<()> {
+    let (title, dl_path, mut _sp) = setup_nav(client, url).await?;
     //let start = Instant::now();
 
     if index == 0 {
         select_reading_mode(client).await?;
     }
-    let max = count_pages(client).await? - 1;
+    let max = client
+        .count_total_pages("span.hoz-total-image", Duration::from_secs(1))
+        .await?;
 
     // hold all the bytes and formatted paths of the imgs
     // to write all at once at the very end
@@ -50,9 +47,9 @@ pub async fn dl_mangareader(
     // (url, dl_path)
     let mut src_urls: HashSet<ReqImageData> = HashSet::new();
     let is_imgs = _find_images(client).await;
-    let mut errors = Vec::with_capacity(max.into());
+    let mut errors = Vec::with_capacity(max);
 
-    for i in 0..max {
+    for i in 0_usize..max {
         if errors.len() > 3 {
             break;
         }
@@ -119,15 +116,7 @@ pub async fn dl_mangareader(
             eprintln!("{}", e.red());
         }
     }
-
-    //let elapsed = start.elapsed();
-    //print_download_complete_msg(elapsed);
-
-    //_sp = Spinner::new(Spinners::Triangle, style_text!("writing data to file.."));
-
-    img_data_vec
-        .into_iter()
-        .for_each(|data| write_img(&data).unwrap());
+    img_data_vec.into_iter().write_all()?;
 
     Ok(())
 }
@@ -144,7 +133,7 @@ async fn _find_images(c: &Client) -> bool {
 }
 
 async fn download_panel_canvas(
-    index: u16,
+    index: usize,
     c: &Client,
     dl_path: &str,
     img_data_vec: &mut Vec<ImageData>,
@@ -205,7 +194,7 @@ async fn download_panel_canvas(
 }
 
 async fn download_panel_img(
-    index: u16,
+    index: usize,
     c: &Client,
     dl_path: &str,
     src_urls: &mut HashSet<ReqImageData>,
@@ -261,7 +250,7 @@ pub async fn download_img_src(
     Ok(img)
 }
 
-async fn count_pages(c: &Client) -> Result<u16, MainError> {
+async fn count_pages(c: &Client) -> Result<usize, MainError> {
     let selector = Locator::Css("span.hoz-total-image");
     let pgs_elm = c
         .wait()
@@ -275,13 +264,8 @@ async fn count_pages(c: &Client) -> Result<u16, MainError> {
 
     let text = pgs_elm.html(true).await?;
 
-    text.parse::<u16>()
+    text.parse::<usize>()
         .map_err(|_| MainError::ParseCounterElement(text))
-}
-
-pub fn write_img(data: &ImageData) -> Result<()> {
-    std::fs::write(&data.path, &data.bytes)?;
-    Ok(())
 }
 
 #[allow(dead_code)]
