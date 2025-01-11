@@ -10,10 +10,13 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::LazyLock,
     time::{self, Duration},
 };
 
-use cli::{get_args, Cli, LogLevel, MangaUrl, SupportedSites};
+use clap::Parser;
+use cli::{Cli, LogLevel, MangaUrl, SupportedSites};
+use color_eyre::{eyre::eyre, Section};
 #[allow(unused_imports)]
 use color_eyre::{
     eyre::{Context, Result},
@@ -21,21 +24,28 @@ use color_eyre::{
     Report,
 };
 use error::{DownloadImageError, MainError, MangaReaderError};
-use fantoccini::{elements::Element, Client, Locator};
+use fantoccini::{elements::Element, error::NewSessionError, Client, Locator};
 use loading::{print_indexes_arg, print_reqerr_count};
 use reqwest::Client as ReqClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string_pretty};
 use sites::{
-    mangafire::dl_mangafire, mangagun::dl_mangagun, mangagun::NavigateGroup,
-    mangareader::dl_mangareader, rawmanga::dl_rawmanga,
+    mangafire::dl_mangafire, mangagun::dl_mangagun, mangareader::dl_mangareader,
+    rawmanga::dl_rawmanga,
 };
-use spinners::Spinner;
+use spinners::{Spinner, Spinners};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 pub trait WebsiteActions {
-    fn count_total_pages(&self, query: &str) -> impl Future<Output = Result<usize>>;
+    fn new_manga_client() -> impl Future<Output = Result<Client, NewSessionError>>;
+
+    fn count_total_pages(
+        &self,
+        query: &str,
+        wait_for: Duration,
+    ) -> impl Future<Output = Result<usize>>;
+    fn click_element(&self, query: &str, wait_for: Duration) -> impl Future<Output = Result<()>>;
     fn query_selector_all(
         &self,
         query: &str,
@@ -46,19 +56,53 @@ pub trait WebsiteActions {
 }
 
 impl WebsiteActions for Client {
-    /// manga_dl fn that finds query
-    /// only if the element has a number in it's inner_text
-    async fn count_total_pages(&self, query: &str) -> Result<usize> {
+    async fn new_manga_client() -> Result<Client, NewSessionError> {
+        let mut builder = fantoccini::ClientBuilder::native();
+
+        if !matches!(PROGRAM_CLI.log, LogLevel::Trace) {
+            let caps: serde_json::Map<String, serde_json::Value> = json!({
+                "moz:firefoxOptions": {
+                    "args": ["-headless"]
+                }
+            })
+            .as_object()
+            .expect("failed to serialize caps")
+            .clone();
+
+            builder.capabilities(caps);
+        }
+
+        builder.connect("http://localhost:4444").await
+    }
+
+    /// Finds the first element that matches the query and returns the text inside the element as a
+    /// number
+    ///
+    /// # ERRORS
+    ///
+    /// Will return an Err if element's innerText doesn't contain a parsable number (ie. contains chars).
+    async fn count_total_pages(&self, query: &str, wait_for: Duration) -> Result<usize> {
         let el = self
             .wait()
-            .at_most(Duration::from_secs(3))
+            .at_most(wait_for)
             .for_element(Locator::Css(query))
-            .await?;
+            .await
+            .context(eyre!("failed to find total page element:\n   [query]='{query}' failed to match any elements."))
+            .with_suggestion(|| "did you enter the right url?")
+            .with_suggestion(|| "open firefox instance by running with --log trace")?;
         let count = el.text().await?;
         let count = count
             .parse::<usize>()
-            .wrap_err(format!("failed to parse total pages: '{count}' as usize"))?;
+            .context(eyre!("failed to parse total pages: '{count}' as usize"))?;
         Ok(count)
+    }
+
+    async fn click_element(&self, query: &str, wait_for: Duration) -> Result<()> {
+        self.wait()
+            .at_most(wait_for)
+            .for_element(Locator::Css(query))
+            .await?;
+        Ok(())
     }
 
     async fn query_selector_all(
@@ -118,7 +162,7 @@ pub enum WebsiteErrorKind {
     #[error("the query matched 0 elements on the page.\n  [query]= '{query}'")]
     QuerySelectorAll { query: String },
     #[error(
-        "failed to query -> '{query}'\n   the query only matched {img_count} <img />s when {page_count} were expected."
+        "{query}'\n    the query only matched {img_count} <img />s when {page_count} were expected."
     )]
     MissingImagesAfterMaxRetries {
         img_count: usize,
@@ -133,7 +177,35 @@ pub struct ImageData {
     pub path: String,
 }
 
-impl ImageData {}
+impl ImageData {
+    fn _write_img(&self) -> Result<()> {
+        std::fs::write(&self.path, &self.bytes)?;
+        Ok(())
+    }
+}
+
+trait WriteAllExt {
+    fn write_all(self) -> Result<()>;
+}
+
+impl<I> WriteAllExt for I
+where
+    I: ExactSizeIterator<Item = ImageData>,
+{
+    fn write_all(self) -> Result<()> {
+        let mut sp = Spinner::new(Spinners::Balloon, "".into());
+        let len = self.len();
+
+        self.into_iter().enumerate().for_each(|(i, d)| {
+            d._write_img().unwrap();
+            let msg = format!("({} .. {})", i + 1, len);
+            sp = Spinner::new(Spinners::Balloon, msg);
+        });
+
+        sp.stop_with_newline();
+        Ok(())
+    }
+}
 
 #[derive(Eq, Hash, PartialEq, Debug)]
 pub struct ReqImageData {
@@ -163,18 +235,17 @@ impl ReqImageData {
     }
 }
 
+static PROGRAM_CLI: LazyLock<Cli> = LazyLock::new(Cli::parse);
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install().unwrap();
-    let instant = time::Instant::now();
-    let args = get_args()?;
-    println!("{:#?}", args.log);
-    match args.log {
-        LogLevel::Trace => {
-            std::env::set_var("RUST_BACKTRACE", "1");
-        }
-        _ => { /* skip */ }
+    if matches!(PROGRAM_CLI.log, LogLevel::Trace | LogLevel::Verbose) {
+        let args = std::env::args();
+        dbg!(&args);
     }
+    //color_eyre::install()?;
+    let instant = time::Instant::now();
+    println!("{:#?}", PROGRAM_CLI.log);
 
     #[cfg(target_os = "windows")]
     let gd_data: &[u8] = include_bytes!("../bin/geckodriver-win.exe");
@@ -185,38 +256,44 @@ async fn main() -> Result<()> {
     let gd_data: &[u8] = include_bytes!("../bin/geckodriver-linux");
 
     #[allow(clippy::zombie_processes)]
-    let mut child = start_gd(gd_data).expect("failed to start gecko driver");
-    let c: Client = start_client(&args.log)
+    let mut child = start_gd(gd_data).wrap_err("failed to start gecko driver")?;
+    let c: Client = Client::new_manga_client()
         .await
         .expect("failed to start fantoccini");
-    let mut errors: Vec<Report> = Vec::new();
-    let urls = args.check_urls()?;
+    let mut errors: Vec<Report> = Vec::with_capacity(PROGRAM_CLI.urls.len());
 
-    if let Some(indexes) = &args.indexes {
+    if let Some(indexes) = &PROGRAM_CLI.pages {
         print_indexes_arg(indexes);
     }
 
-    for (i, url) in urls.iter().enumerate() {
-        match url.site {
-            cli::SupportedSites::MangaReader => {
-                if let Err(e) = dl_mangareader(&c, url, &args, i).await {
-                    errors.push(e);
-                };
-            }
-            cli::SupportedSites::MangaGun => {
-                if let Err(e) = dl_mangagun(&c, url, &args).await {
-                    errors.push(e);
-                };
-            }
-            cli::SupportedSites::RawManga => {
-                if let Err(e) = dl_rawmanga(&c, url, &args).await {
-                    errors.push(e);
-                };
-            }
-            cli::SupportedSites::MangaFire => {
-                if let Err(e) = dl_mangafire(&c, url, &args).await {
-                    errors.push(e);
-                };
+    for (i, url) in PROGRAM_CLI.urls.iter().enumerate() {
+        let expanded = url.to_vec();
+        for url in expanded {
+            match url.site {
+                cli::SupportedSites::MangaReader => {
+                    if let Err(e) = dl_mangareader(&c, &url, i).await {
+                        errors.push(e);
+                    };
+                }
+                cli::SupportedSites::MangaGun => {
+                    if let Err(e) = dl_mangagun(&c, &url).await {
+                        errors.push(e);
+                    };
+                }
+                cli::SupportedSites::RawManga => {
+                    if let Err(e) = dl_rawmanga(&c, &url).await {
+                        errors.push(e);
+                    };
+                }
+                cli::SupportedSites::MangaFire => {
+                    if let Err(e) = dl_mangafire(&c, &url).await {
+                        errors.push(e);
+                    }
+                }
+                _ => {
+                    panic!("website unsupported")
+                    // function to TRY download imgs for any website
+                }
             }
         }
     }
@@ -229,7 +306,12 @@ async fn main() -> Result<()> {
     cleanup();
 
     if !errors.is_empty() {
-        let titles: Vec<String> = urls.into_iter().flat_map(|url| url.title).collect();
+        let titles: Vec<String> = PROGRAM_CLI
+            .urls
+            .to_vec()
+            .iter()
+            .map(|url| url.inner.clone())
+            .collect();
         print_reqerr_count(errors.len(), &titles);
         eprintln!("{}", style_text!("STDERR:", error));
         for e in errors {
@@ -337,25 +419,6 @@ pub fn start_gd(gd_data: &[u8]) -> Result<Child, std::io::Error> {
     Ok(child)
 }
 
-async fn start_client(log: &LogLevel) -> Result<Client, fantoccini::error::NewSessionError> {
-    let mut builder = fantoccini::ClientBuilder::native();
-
-    if log != &LogLevel::Trace {
-        let caps: serde_json::Map<String, serde_json::Value> = json!({
-            "moz:firefoxOptions": {
-                "args": ["-headless"]
-            }
-        })
-        .as_object()
-        .expect("failed to serialize caps")
-        .clone();
-
-        builder.capabilities(caps);
-    }
-
-    builder.connect("http://localhost:4444").await
-}
-
 /// handle any redirect ads by closing the newly opened tab
 pub async fn g_close_open_window(c: &Client) -> Result<(), MangaReaderError> {
     let handles = c.windows().await?;
@@ -391,10 +454,12 @@ pub async fn g_handle_popup(c: &Client) -> Result<(), MainError> {
     Ok(())
 }
 
+pub type NavigateGroup = (String, String, Spinner);
+
 /// returns [`NavigateGroup`]
-pub async fn setup_nav(client: &Client, url: &MangaUrl, args: &Cli) -> Result<NavigateGroup> {
+pub async fn setup_nav(client: &Client, url: &MangaUrl) -> Result<NavigateGroup> {
     let title = url.title.clone().unwrap_or_else(|| gen_rand().to_string());
-    let dl_path = match &args.input_path {
+    let dl_path = match &PROGRAM_CLI.input_path {
         Some(p) => format!("{p}/{}", title),
         None => {
             format!("./download/{title}")
