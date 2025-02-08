@@ -30,7 +30,7 @@ pub fn indexes_failed_msg(len: usize) -> String {
 }
 
 pub fn print_download_complete_msg(elapsed: Duration) {
-    let elap = format!("{:.?}", elapsed);
+    let elap = format!("{:?}", elapsed);
     // let msg = format!(
     //     "finished in {}.",
     //     //style_text!("download complete", success),
